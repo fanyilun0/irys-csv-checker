@@ -19,6 +19,9 @@ from web3.middleware import geth_poa_middleware
 import requests
 from colorama import init, Fore, Style
 from tabulate import tabulate
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+from csv_filter import CSVFilter
 # 使用标准输入处理用户交互
 
 # 初始化colorama
@@ -44,6 +47,12 @@ class IrysChecker:
         # 钱包数据
         self.wallets = []
         self.loaded_files = []  # 记录已加载的文件信息
+        
+        # CSV过滤器
+        self.csv_filter = CSVFilter()
+        
+        # 线程锁
+        self.balance_lock = threading.Lock()
         
     def _init_web3_connection(self):
         """初始化Web3连接"""
@@ -388,7 +397,6 @@ class IrysChecker:
     def get_balance(self, address: str) -> Optional[Decimal]:
         """获取指定地址的余额"""
         if not self.w3 or not hasattr(self.w3.eth, 'get_balance'):
-            print(f"{Fore.YELLOW}⚠️  离线模式，无法获取余额: {address}{Style.RESET_ALL}")
             return None
             
         try:
@@ -398,18 +406,45 @@ class IrysChecker:
             balance_ether = self.w3.from_wei(balance_wei, 'ether')
             return Decimal(str(balance_ether))
         except Exception as e:
-            print(f"{Fore.RED}❌ 获取余额失败 {address}: {str(e)}{Style.RESET_ALL}")
+            with self.balance_lock:
+                print(f"\r{Fore.RED}❌ 获取余额失败 {address[:10]}...: {str(e)}{Style.RESET_ALL}")
             return None
     
-    def check_all_balances(self):
+    def get_balance_for_wallet(self, wallet_data: Tuple[int, Dict]) -> Tuple[int, Optional[Decimal]]:
+        """
+        为单个钱包获取余额（多线程使用）
+        
+        Args:
+            wallet_data: (索引, 钱包信息) 元组
+            
+        Returns:
+            (索引, 余额) 元组
+        """
+        index, wallet = wallet_data
+        balance = self.get_balance(wallet['address'])
+        return index, balance
+    
+    def check_all_balances(self, use_multithreading: bool = True):
         """批量查看所有钱包余额"""
         if not self.wallets:
             print(f"{Fore.YELLOW}⚠️  请先加载钱包CSV文件{Style.RESET_ALL}")
             return
         
+        if not self.w3 or not hasattr(self.w3.eth, 'get_balance'):
+            print(f"{Fore.YELLOW}⚠️  离线模式，无法获取余额{Style.RESET_ALL}")
+            return
+        
         print(f"{Fore.CYAN}📊 正在查询钱包余额...{Style.RESET_ALL}")
         
-        # 更新余额信息
+        if use_multithreading and len(self.wallets) > 5:
+            self._check_balances_multithreaded()
+        else:
+            self._check_balances_sequential()
+        
+        self._display_balance_results()
+    
+    def _check_balances_sequential(self):
+        """串行查询余额"""
         total_balance = Decimal('0')
         for i, wallet in enumerate(self.wallets, 1):
             print(f"查询进度: {i}/{len(self.wallets)} - {wallet['address'][:10]}...", end='\r')
@@ -417,6 +452,50 @@ class IrysChecker:
             wallet['balance'] = balance
             if balance is not None:
                 total_balance += balance
+        print()  # 换行
+    
+    def _check_balances_multithreaded(self):
+        """多线程查询余额"""
+        print(f"{Fore.GREEN}⚡ 使用多线程加速查询 (线程数: {min(20, len(self.wallets))}){Style.RESET_ALL}")
+        
+        # 准备任务数据
+        wallet_tasks = [(i, wallet) for i, wallet in enumerate(self.wallets)]
+        completed_count = 0
+        
+        # 使用线程池执行查询
+        max_workers = min(20, len(self.wallets))  # 最多20个线程
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # 提交所有任务
+            future_to_index = {
+                executor.submit(self.get_balance_for_wallet, task): task[0] 
+                for task in wallet_tasks
+            }
+            
+            # 处理完成的任务
+            for future in as_completed(future_to_index):
+                index = future_to_index[future]
+                try:
+                    wallet_index, balance = future.result()
+                    self.wallets[wallet_index]['balance'] = balance
+                    completed_count += 1
+                    
+                    # 显示进度
+                    with self.balance_lock:
+                        print(f"\r查询进度: {completed_count}/{len(self.wallets)} - {self.wallets[wallet_index]['address'][:10]}...", end='')
+                        
+                except Exception as e:
+                    with self.balance_lock:
+                        print(f"\r{Fore.RED}❌ 任务执行失败: {str(e)}{Style.RESET_ALL}")
+        
+        print()  # 换行
+    
+    def _display_balance_results(self):
+        """显示余额查询结果"""
+        # 计算总余额
+        total_balance = Decimal('0')
+        for wallet in self.wallets:
+            if wallet.get('balance') is not None:
+                total_balance += wallet['balance']
         
         # 创建表格数据
         table_data = []
@@ -625,12 +704,48 @@ class IrysChecker:
         print(f"{Fore.GREEN}✅ 成功: {success_count} 笔{Style.RESET_ALL}")
         print(f"{Fore.RED}❌ 失败: {failed_count} 笔{Style.RESET_ALL}")
     
+    def filter_wallets_and_export(self):
+        """过滤有余额的钱包并导出为新的CSV文件"""
+        if not self.wallets:
+            print(f"{Fore.YELLOW}⚠️  请先加载钱包CSV文件{Style.RESET_ALL}")
+            return
+        
+        # 检查是否已经查询过余额
+        has_balance_info = any(wallet.get('balance') is not None for wallet in self.wallets)
+        
+        if not has_balance_info:
+            print(f"{Fore.CYAN}💡 尚未查询余额信息，需要先进行余额查询...{Style.RESET_ALL}")
+            print(f"{Fore.CYAN}是否现在查询所有钱包余额？(y/n): {Style.RESET_ALL}", end='')
+            choice = input().strip().lower()
+            
+            if choice in ['y', 'yes', '是']:
+                self.check_all_balances()
+            else:
+                print(f"{Fore.YELLOW}⚠️  没有余额信息，无法进行过滤{Style.RESET_ALL}")
+                return
+        
+        # 检查是否有有效的余额数据
+        valid_balance_count = sum(1 for wallet in self.wallets if wallet.get('balance') is not None)
+        if valid_balance_count == 0:
+            print(f"{Fore.RED}❌ 没有有效的余额数据{Style.RESET_ALL}")
+            return
+        
+        # 执行交互式过滤
+        print(f"\n{Fore.CYAN}🔍 开始钱包过滤流程...{Style.RESET_ALL}")
+        success = self.csv_filter.interactive_filter(self.wallets)
+        
+        if success:
+            print(f"\n{Fore.GREEN}✅ 钱包过滤和导出完成！{Style.RESET_ALL}")
+        else:
+            print(f"\n{Fore.YELLOW}⚠️  钱包过滤流程未完成{Style.RESET_ALL}")
+    
     def show_menu(self):
         """显示主菜单"""
         menu_options = [
             "📁 加载单个CSV文件",
             "📂 批量加载目录中的CSV文件",
             "💰 查看所有钱包余额", 
+            "🔍 过滤有余额钱包并导出CSV",
             "📤 多对一转账（归集）",
             "📤 一对多转账",
             "ℹ️  显示网络信息",
@@ -742,18 +857,22 @@ class IrysChecker:
                     self.check_all_balances()
                     input("按回车继续...")
                 
-                elif choice == 3:  # 多对一转账
+                elif choice == 3:  # 过滤有余额钱包并导出CSV
+                    self.filter_wallets_and_export()
+                    input("按回车继续...")
+                
+                elif choice == 4:  # 多对一转账
                     self.bulk_transfer_many_to_one()
                     input("按回车继续...")
                 
-                elif choice == 4:  # 一对多转账
+                elif choice == 5:  # 一对多转账
                     self.bulk_transfer_one_to_many()
                     input("按回车继续...")
                 
-                elif choice == 5:  # 显示网络信息
+                elif choice == 6:  # 显示网络信息
                     self.show_network_info()
                 
-                elif choice == 6:  # 退出
+                elif choice == 7:  # 退出
                     print(f"\n{Fore.GREEN}👋 感谢使用！{Style.RESET_ALL}")
                     break
                 

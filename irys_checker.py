@@ -424,8 +424,8 @@ class IrysChecker:
         balance = self.get_balance(wallet['address'])
         return index, balance
     
-    def check_all_balances(self, use_multithreading: bool = True):
-        """批量查看所有钱包余额"""
+    def check_all_balances(self):
+        """批量查看所有钱包余额（使用多线程）"""
         if not self.wallets:
             print(f"{Fore.YELLOW}⚠️  请先加载钱包CSV文件{Style.RESET_ALL}")
             return
@@ -435,35 +435,21 @@ class IrysChecker:
             return
         
         print(f"{Fore.CYAN}📊 正在查询钱包余额...{Style.RESET_ALL}")
-        
-        if use_multithreading and len(self.wallets) > 5:
-            self._check_balances_multithreaded()
-        else:
-            self._check_balances_sequential()
-        
+        self._check_balances_multithreaded()
         self._display_balance_results()
-    
-    def _check_balances_sequential(self):
-        """串行查询余额"""
-        total_balance = Decimal('0')
-        for i, wallet in enumerate(self.wallets, 1):
-            print(f"查询进度: {i}/{len(self.wallets)} - {wallet['address'][:10]}...", end='\r')
-            balance = self.get_balance(wallet['address'])
-            wallet['balance'] = balance
-            if balance is not None:
-                total_balance += balance
-        print()  # 换行
     
     def _check_balances_multithreaded(self):
         """多线程查询余额"""
-        print(f"{Fore.GREEN}⚡ 使用多线程加速查询 (线程数: {min(20, len(self.wallets))}){Style.RESET_ALL}")
+        wallet_count = len(self.wallets)
+        max_workers = 8
+        
+        print(f"{Fore.GREEN}⚡ 使用多线程加速查询 (线程数: {max_workers}){Style.RESET_ALL}")
         
         # 准备任务数据
         wallet_tasks = [(i, wallet) for i, wallet in enumerate(self.wallets)]
         completed_count = 0
         
         # 使用线程池执行查询
-        max_workers = min(20, len(self.wallets))  # 最多20个线程
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             # 提交所有任务
             future_to_index = {
@@ -481,13 +467,16 @@ class IrysChecker:
                     
                     # 显示进度
                     with self.balance_lock:
-                        print(f"\r查询进度: {completed_count}/{len(self.wallets)} - {self.wallets[wallet_index]['address'][:10]}...", end='')
+                        percentage = (completed_count / wallet_count) * 100
+                        print(f"\r查询进度: {completed_count}/{wallet_count} ({percentage:.1f}%) - {self.wallets[wallet_index]['address'][:10]}...", end='')
                         
                 except Exception as e:
+                    completed_count += 1
                     with self.balance_lock:
-                        print(f"\r{Fore.RED}❌ 任务执行失败: {str(e)}{Style.RESET_ALL}")
+                        print(f"\r{Fore.RED}❌ 查询失败: {str(e)[:50]}...{Style.RESET_ALL}")
         
         print()  # 换行
+        print(f"{Fore.GREEN}✅ 余额查询完成！{Style.RESET_ALL}")
     
     def _display_balance_results(self):
         """显示余额查询结果"""
